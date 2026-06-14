@@ -1,8 +1,8 @@
 import { cache } from 'react'
 import { cookies } from 'next/headers'
 import { verifyToken } from '@/lib/auth/jwt'
-import { getSession } from '@/lib/auth/session'
 import { AUTH_COOKIE_NAME } from '@/lib/constants/auth'
+import type { AuthStore } from './auth-store.types'
 
 export type CurrentUser = { id: string; email: string; name: string; role: string }
 
@@ -21,7 +21,30 @@ class AuthError extends Error {
 
 export { AuthError }
 
-async function resolveAuthUser(options: ResolveAuthOptions = { errorMode: 'silent' }): Promise<CurrentUser> {
+let defaultStorePromise: Promise<AuthStore> | null = null
+
+async function createDefaultStore(): Promise<AuthStore> {
+  const { RedisAuthStore } = await import('./redis-auth-store')
+  return new RedisAuthStore()
+}
+
+export function setDefaultAuthStore(store: AuthStore): void {
+  defaultStorePromise = Promise.resolve(store)
+}
+
+async function getStore(store?: AuthStore): Promise<AuthStore> {
+  if (store) return store
+  if (!defaultStorePromise) {
+    defaultStorePromise = createDefaultStore()
+  }
+  return defaultStorePromise
+}
+
+async function resolveAuthUser(
+  options: ResolveAuthOptions = { errorMode: 'silent' },
+  store?: AuthStore,
+): Promise<CurrentUser> {
+  const s = await getStore(store)
   const cookieStore = await cookies()
   const token = cookieStore.get(AUTH_COOKIE_NAME)?.value
 
@@ -38,10 +61,9 @@ async function resolveAuthUser(options: ResolveAuthOptions = { errorMode: 'silen
     return null as unknown as CurrentUser
   }
 
-  const session = await getSession(payload.sessionId)
+  const session = await s.getSession(payload.sessionId)
   if (!session) {
-    const { isRedisReady } = await import('@/lib/db/redis')
-    const redisAvailable = isRedisReady()
+    const redisAvailable = await s.isRedisReady()
     if (!redisAvailable) {
       return {
         id: payload.userId,
@@ -59,21 +81,21 @@ async function resolveAuthUser(options: ResolveAuthOptions = { errorMode: 'silen
     id: session.userId,
     email: session.email,
     name: session.name,
-    role: session.role
+    role: session.role,
   }
 }
 
-export const getCurrentUser = cache(async (): Promise<CurrentUser | null> => {
+export const getCurrentUser = cache(async (store?: AuthStore): Promise<CurrentUser | null> => {
   try {
-    return await resolveAuthUser({ errorMode: 'silent' })
+    return await resolveAuthUser({ errorMode: 'silent' }, store)
   } catch {
     return null
   }
 })
 
-export async function requireAuth(): Promise<CurrentUser> {
+export async function requireAuth(store?: AuthStore): Promise<CurrentUser> {
   try {
-    const user = await resolveAuthUser({ errorMode: 'generic' })
+    const user = await resolveAuthUser({ errorMode: 'generic' }, store)
     return user
   } catch (error) {
     if (error instanceof AuthError) throw error
@@ -81,14 +103,14 @@ export async function requireAuth(): Promise<CurrentUser> {
   }
 }
 
-export async function requireRole(allowedRoles: string[]): Promise<CurrentUser> {
-  const user = await requireAuth()
+export async function requireRole(allowedRoles: string[], store?: AuthStore): Promise<CurrentUser> {
+  const user = await requireAuth(store)
   if (!allowedRoles.includes(user.role)) {
     throw new Error('Forbidden')
   }
   return user
 }
 
-export async function resolveAuthUserDetailed(): Promise<CurrentUser> {
-  return resolveAuthUser({ errorMode: 'detailed' })
+export async function resolveAuthUserDetailed(store?: AuthStore): Promise<CurrentUser> {
+  return resolveAuthUser({ errorMode: 'detailed' }, store)
 }

@@ -10,27 +10,27 @@ const { mockGenerateToken, mockVerifyToken, mockRevokeToken } = vi.hoisted(() =>
   mockRevokeToken: vi.fn().mockResolvedValue(undefined),
 }))
 
-const { mockCreateSession, mockDeleteSession } = vi.hoisted(() => ({
-  mockCreateSession: vi.fn().mockResolvedValue('session-1'),
-  mockDeleteSession: vi.fn().mockResolvedValue(undefined),
-}))
-
-const { mockRecordFailedAttempt, mockClearFailedAttempts, mockIsAccountLocked, mockIsLockedByIp, mockRecordFailedAttemptByIp, mockClearFailedAttemptsByIp } = vi.hoisted(() => ({
-  mockRecordFailedAttempt: vi.fn().mockResolvedValue({ remaining: 4, locked: false }),
-  mockClearFailedAttempts: vi.fn(),
-  mockIsAccountLocked: vi.fn().mockResolvedValue(false),
-  mockIsLockedByIp: vi.fn().mockResolvedValue(false),
-  mockRecordFailedAttemptByIp: vi.fn(),
-  mockClearFailedAttemptsByIp: vi.fn(),
+const { mockPrismaFindUnique, mockPrismaUpdate } = vi.hoisted(() => ({
+  mockPrismaFindUnique: vi.fn(),
+  mockPrismaUpdate: vi.fn(),
 }))
 
 const { mockServerActionWrite } = vi.hoisted(() => ({
   mockServerActionWrite: vi.fn(),
 }))
 
-const { mockPrismaFindUnique, mockPrismaUpdate } = vi.hoisted(() => ({
-  mockPrismaFindUnique: vi.fn(),
-  mockPrismaUpdate: vi.fn(),
+vi.mock('@/lib/db/redis', () => ({
+  redis: {
+    setex: vi.fn().mockResolvedValue('OK'),
+    get: vi.fn(),
+    del: vi.fn().mockResolvedValue(1),
+    expire: vi.fn().mockResolvedValue(1),
+    exists: vi.fn().mockResolvedValue(0),
+    ping: vi.fn().mockResolvedValue('PONG'),
+    script: vi.fn().mockResolvedValue('script-sha'),
+    evalsha: vi.fn().mockResolvedValue([0, 4, 0]),
+  },
+  isRedisReady: vi.fn().mockReturnValue(true),
 }))
 
 vi.mock('@/lib/db/prisma', () => ({
@@ -51,20 +51,6 @@ vi.mock('@/lib/auth/jwt', () => ({
   generateToken: mockGenerateToken,
   verifyToken: mockVerifyToken,
   revokeToken: mockRevokeToken,
-}))
-
-vi.mock('@/lib/auth/session', () => ({
-  createSession: mockCreateSession,
-  deleteSession: mockDeleteSession,
-}))
-
-vi.mock('@/lib/auth/lockout', () => ({
-  recordFailedAttempt: mockRecordFailedAttempt,
-  clearFailedAttempts: mockClearFailedAttempts,
-  isAccountLocked: mockIsAccountLocked,
-  isLockedByIp: mockIsLockedByIp,
-  recordFailedAttemptByIp: mockRecordFailedAttemptByIp,
-  clearFailedAttemptsByIp: mockClearFailedAttemptsByIp,
 }))
 
 vi.mock('@/lib/actions/server-action-write', () => ({
@@ -102,9 +88,6 @@ import * as authModule from '@/app/actions/auth'
 describe('Auth Actions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockIsLockedByIp.mockResolvedValue(false)
-    mockIsAccountLocked.mockResolvedValue(false)
-    mockRecordFailedAttempt.mockResolvedValue({ remaining: 4, locked: false })
     mockPrismaFindUnique.mockReset()
     mockPrismaUpdate.mockReset()
   })
@@ -123,28 +106,6 @@ describe('Auth Actions', () => {
       )
     })
 
-    it('should reject locked IP inside writeFn', async () => {
-      mockServerActionWrite.mockImplementation(async (_permission: string, _csrfToken: string, writeFn: () => Promise<unknown>) => {
-        return writeFn()
-      })
-      mockIsLockedByIp.mockResolvedValue(true)
-
-      const result = await authModule.login('test@test.com', 'password', false, 'valid-token')
-
-      expect(result.error).toContain('Trop de tentatives depuis cet emplacement')
-    })
-
-    it('should reject locked account inside writeFn', async () => {
-      mockServerActionWrite.mockImplementation(async (_permission: string, _csrfToken: string, writeFn: () => Promise<unknown>) => {
-        return writeFn()
-      })
-      mockIsAccountLocked.mockResolvedValue(true)
-
-      const result = await authModule.login('test@test.com', 'password', false, 'valid-token')
-
-      expect(result.error).toContain('Compte temporairement verrouillé')
-    })
-
     it('should reject non-existent user inside writeFn', async () => {
       mockServerActionWrite.mockImplementation(async (_permission: string, _csrfToken: string, writeFn: () => Promise<unknown>) => {
         return writeFn()
@@ -154,8 +115,6 @@ describe('Auth Actions', () => {
       const result = await authModule.login('nonexistent@test.com', 'password', false, 'valid-token')
 
       expect(result.error).toBe('Email ou mot de passe invalide')
-      expect(mockRecordFailedAttempt).toHaveBeenCalled()
-      expect(mockRecordFailedAttemptByIp).toHaveBeenCalled()
     })
 
     it('should reject wrong password inside writeFn', async () => {
@@ -190,9 +149,6 @@ describe('Auth Actions', () => {
       const result = await authModule.login('test@test.com', 'correct-password', false, 'valid-token')
 
       expect(result.success).toBe(true)
-      expect(mockClearFailedAttempts).toHaveBeenCalledWith('test@test.com')
-      expect(mockClearFailedAttemptsByIp).toHaveBeenCalledWith('127.0.0.1')
-      expect(mockCreateSession).toHaveBeenCalled()
       expect(mockGenerateToken).toHaveBeenCalled()
     })
 
@@ -211,8 +167,7 @@ describe('Auth Actions', () => {
 
       await authModule.login('test@test.com', 'correct-password', false, 'valid-token')
 
-      expect(mockClearFailedAttempts).toHaveBeenCalled()
-      expect(mockClearFailedAttemptsByIp).toHaveBeenCalled()
+      expect(mockPrismaUpdate).toHaveBeenCalled()
     })
 
     it('should return CSRF error when serverActionWrite returns CSRF error', async () => {
@@ -244,7 +199,6 @@ describe('Auth Actions', () => {
         'authenticated', 'valid-csrf-token', expect.any(Function),
       )
       expect(result.success).toBe(true)
-      expect(mockDeleteSession).toHaveBeenCalled()
       expect(mockRevokeToken).toHaveBeenCalled()
     })
 

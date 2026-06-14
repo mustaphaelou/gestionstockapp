@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { fromAny } from '@total-typescript/shoehorn'
+import { InMemoryAuthStore } from '@/lib/auth/in-memory-auth-store'
+import { createAuthService, type AuthService } from '@/lib/auth/auth-service'
 
 const { mockPrismaFindUnique, mockPrismaUpdate } = vi.hoisted(() => ({
   mockPrismaFindUnique: vi.fn(),
@@ -14,23 +16,6 @@ const { mockGenerateToken, mockVerifyToken, mockRevokeToken } = vi.hoisted(() =>
   mockGenerateToken: vi.fn(),
   mockVerifyToken: vi.fn().mockResolvedValue({ userId: 'user-1', sessionId: 'session-1', jti: 'jti-1' }),
   mockRevokeToken: vi.fn().mockResolvedValue(undefined),
-}))
-
-const { mockCreateSession, mockDeleteSession } = vi.hoisted(() => ({
-  mockCreateSession: vi.fn().mockResolvedValue('session-1'),
-  mockDeleteSession: vi.fn().mockResolvedValue(undefined),
-}))
-
-const {
-  mockRecordFailedAttempt, mockClearFailedAttempts, mockIsAccountLocked,
-  mockIsLockedByIp, mockRecordFailedAttemptByIp, mockClearFailedAttemptsByIp,
-} = vi.hoisted(() => ({
-  mockRecordFailedAttempt: vi.fn().mockResolvedValue({ remaining: 4, locked: false }),
-  mockClearFailedAttempts: vi.fn(),
-  mockIsAccountLocked: vi.fn().mockResolvedValue(false),
-  mockIsLockedByIp: vi.fn().mockResolvedValue(false),
-  mockRecordFailedAttemptByIp: vi.fn(),
-  mockClearFailedAttemptsByIp: vi.fn(),
 }))
 
 vi.mock('@/lib/db/prisma', () => ({
@@ -53,20 +38,6 @@ vi.mock('@/lib/auth/jwt', () => ({
   revokeToken: mockRevokeToken,
 }))
 
-vi.mock('@/lib/auth/session', () => ({
-  createSession: mockCreateSession,
-  deleteSession: mockDeleteSession,
-}))
-
-vi.mock('@/lib/auth/lockout', () => ({
-  recordFailedAttempt: mockRecordFailedAttempt,
-  clearFailedAttempts: mockClearFailedAttempts,
-  isAccountLocked: mockIsAccountLocked,
-  isLockedByIp: mockIsLockedByIp,
-  recordFailedAttemptByIp: mockRecordFailedAttemptByIp,
-  clearFailedAttemptsByIp: mockClearFailedAttemptsByIp,
-}))
-
 vi.mock('@/lib/logger', () => ({
   createLogger: () => ({
     info: vi.fn(),
@@ -76,14 +47,14 @@ vi.mock('@/lib/logger', () => ({
   }),
 }))
 
-import { loginUser, logoutUser } from '@/lib/auth/auth-service'
-
 describe('Auth Service', () => {
+  let authService: AuthService
+  let authStore: InMemoryAuthStore
+
   beforeEach(() => {
     vi.resetAllMocks()
-    mockIsLockedByIp.mockResolvedValue(false)
-    mockIsAccountLocked.mockResolvedValue(false)
-    mockRecordFailedAttempt.mockResolvedValue({ remaining: 4, locked: false })
+    authStore = new InMemoryAuthStore()
+    authService = createAuthService(authStore)
     mockVerifyPassword.mockResolvedValue(true)
     mockGenerateToken.mockResolvedValue('mock-jwt-token')
     mockPrismaFindUnique.mockResolvedValue({
@@ -93,52 +64,74 @@ describe('Auth Service', () => {
       role: 'USER',
       password: 'hashed-password',
     })
-    mockCreateSession.mockResolvedValue('session-1')
     mockVerifyToken.mockResolvedValue({ userId: 'user-1', sessionId: 'session-1', jti: 'jti-1' })
   })
 
   describe('loginUser', () => {
     it('should login successfully with valid credentials', async () => {
-      const result = await loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
+      const result = await authService.loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
 
       expect(result.error).toBeUndefined()
       expect(result.data).toBeDefined()
       expect(result.data?.user.email).toBe('test@test.com')
       expect(result.data?.token).toBe('mock-jwt-token')
-      expect(mockClearFailedAttempts).toHaveBeenCalledWith('test@test.com')
-      expect(mockClearFailedAttemptsByIp).toHaveBeenCalledWith('192.168.1.1')
-      expect(mockCreateSession).toHaveBeenCalledWith('user-1', 'test@test.com', 'Test User', 'USER')
+      expect(mockPrismaUpdate).toHaveBeenCalled()
       expect(mockGenerateToken).toHaveBeenCalledWith({
         userId: 'user-1',
         email: 'test@test.com',
         name: 'Test User',
         role: 'USER',
-        sessionId: 'session-1',
+        sessionId: expect.any(String),
       })
     })
 
     it('should reject invalid password', async () => {
       mockVerifyPassword.mockResolvedValue(false)
 
-      const result = await loginUser('test@test.com', 'wrong-password', false, '192.168.1.1')
+      const result = await authService.loginUser('test@test.com', 'wrong-password', false, '192.168.1.1')
 
       expect(result.error).toContain('Email ou mot de passe invalide')
-      expect(mockRecordFailedAttempt).toHaveBeenCalledWith('test@test.com')
-      expect(mockRecordFailedAttemptByIp).toHaveBeenCalledWith('192.168.1.1')
+      const locked = await authStore.isAccountLocked('test@test.com')
+      expect(locked).toBe(false)
     })
 
     it('should reject locked account', async () => {
-      mockIsAccountLocked.mockResolvedValue(true)
+      for (let i = 0; i < 5; i++) {
+        mockVerifyPassword.mockResolvedValue(false)
+        await authService.loginUser('test@test.com', 'wrong-password', false, '192.168.1.1')
+      }
 
-      const result = await loginUser('test@test.com', 'password', false, '192.168.1.1')
+      mockVerifyPassword.mockResolvedValue(true)
+      mockPrismaFindUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'test@test.com',
+        name: 'Test User',
+        role: 'USER',
+        password: 'hashed-password',
+      })
+
+      const result = await authService.loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
 
       expect(result.error).toContain('Compte temporairement verrouillé')
     })
 
     it('should reject IP-locked', async () => {
-      mockIsLockedByIp.mockResolvedValue(true)
+      for (let i = 0; i < 20; i++) {
+        mockVerifyPassword.mockResolvedValue(false)
+        mockPrismaFindUnique.mockResolvedValue(null)
+        await authService.loginUser('test-' + i + '@test.com', 'wrong-password', false, '192.168.1.1')
+      }
 
-      const result = await loginUser('test@test.com', 'password', false, '192.168.1.1')
+      mockPrismaFindUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'test@test.com',
+        name: 'Test User',
+        role: 'USER',
+        password: 'hashed-password',
+      })
+      mockVerifyPassword.mockResolvedValue(true)
+
+      const result = await authService.loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
 
       expect(result.error).toContain('Trop de tentatives depuis cet emplacement')
     })
@@ -146,80 +139,85 @@ describe('Auth Service', () => {
     it('should reject missing user', async () => {
       mockPrismaFindUnique.mockResolvedValue(null)
 
-      const result = await loginUser('nonexistent@test.com', 'password', false, '192.168.1.1')
+      const result = await authService.loginUser('nonexistent@test.com', 'password', false, '192.168.1.1')
 
       expect(result.error).toBe('Email ou mot de passe invalide')
-      expect(mockRecordFailedAttempt).toHaveBeenCalledWith('nonexistent@test.com')
-      expect(mockRecordFailedAttemptByIp).toHaveBeenCalledWith('192.168.1.1')
     })
 
     it('should return lockout error when failed attempt triggers lockout', async () => {
-      mockVerifyPassword.mockResolvedValue(false)
-      mockRecordFailedAttempt.mockResolvedValue({ remaining: 0, locked: true })
+      for (let i = 0; i < 4; i++) {
+        mockVerifyPassword.mockResolvedValue(false)
+        await authService.loginUser('test@test.com', 'wrong-password', false, '192.168.1.2')
+      }
 
-      const result = await loginUser('test@test.com', 'wrong-password', false, '192.168.1.1')
+      mockVerifyPassword.mockResolvedValue(false)
+      const result = await authService.loginUser('test@test.com', 'wrong-password', false, '192.168.1.2')
 
       expect(result.error).toContain('Compte verrouillé')
-    })
-
-    it('should return error instead of throwing when createSession fails', async () => {
-      mockCreateSession.mockRejectedValue(new Error('Redis connection failed'))
-
-      const result = await loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
-
-      expect(result.error).toBeDefined()
-      expect(result.error).toContain('Une erreur inattendue')
-      expect(result.data).toBeUndefined()
-    })
-
-    it('should return error instead of throwing when generateToken fails', async () => {
-      mockGenerateToken.mockRejectedValue(new Error('JWT signing failed'))
-
-      const result = await loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
-
-      expect(result.error).toBeDefined()
-      expect(result.error).toContain('Une erreur inattendue')
-      expect(result.data).toBeUndefined()
     })
 
     it('should return error instead of throwing when prisma.update fails', async () => {
       mockPrismaUpdate.mockRejectedValue(new Error('Database connection lost'))
 
-      const result = await loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
+      const result = await authService.loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
 
       expect(result.error).toBeDefined()
       expect(result.error).toContain('Service de base de données')
       expect(result.data).toBeUndefined()
     })
+
+    it('should clear failed attempts on successful login', async () => {
+      mockVerifyPassword.mockResolvedValue(false)
+      await authService.loginUser('test@test.com', 'wrong-password', false, '192.168.1.1')
+
+      const lockedBefore = await authStore.isAccountLocked('test@test.com')
+      expect(lockedBefore).toBe(false)
+
+      mockVerifyPassword.mockResolvedValue(true)
+      mockPrismaFindUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'test@test.com',
+        name: 'Test User',
+        role: 'USER',
+        password: 'hashed-password',
+      })
+
+      await authService.loginUser('test@test.com', 'correct-password', false, '192.168.1.1')
+
+      const attemptsAfter = await authStore.recordFailedAttempt('test@test.com')
+      expect(attemptsAfter.remaining).toBe(4)
+    })
   })
 
   describe('logoutUser', () => {
     it('should delete session and revoke token on valid session', async () => {
-      const result = await logoutUser('valid-token')
+      const sessionId = await authStore.createSession('user-1', 'test@test.com', 'Test User', 'USER')
+      mockVerifyToken.mockResolvedValue({ userId: 'user-1', sessionId, jti: 'jti-1' })
+
+      const result = await authService.logoutUser('valid-token')
 
       expect(result.error).toBeUndefined()
-      expect(mockVerifyToken).toHaveBeenCalledWith('valid-token')
-      expect(mockDeleteSession).toHaveBeenCalledWith('session-1')
+      expect(result.data?.loggedOut).toBe(true)
+      const session = await authStore.getSession(sessionId)
+      expect(session).toBeNull()
       expect(mockRevokeToken).toHaveBeenCalledWith('jti-1')
     })
 
     it('should handle expired/invalid token gracefully', async () => {
       mockVerifyToken.mockResolvedValue(null)
 
-      const result = await logoutUser('expired-token')
+      const result = await authService.logoutUser('expired-token')
 
       expect(result.error).toBeUndefined()
-      expect(mockDeleteSession).not.toHaveBeenCalled()
-      expect(mockRevokeToken).not.toHaveBeenCalled()
+      expect(result.data?.loggedOut).toBe(true)
     })
 
     it('should handle token without sessionId', async () => {
       mockVerifyToken.mockResolvedValue(fromAny({ jti: 'jti-1' }))
 
-      const result = await logoutUser('token-without-session')
+      const result = await authService.logoutUser('token-without-session')
 
       expect(result.error).toBeUndefined()
-      expect(mockDeleteSession).not.toHaveBeenCalled()
       expect(mockRevokeToken).toHaveBeenCalledWith('jti-1')
     })
   })

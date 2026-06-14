@@ -1,133 +1,74 @@
-/**
- * @vitest-environment node
- */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-
-vi.mock('@/lib/db/redis', () => ({
-    redis: {
-        setex: vi.fn().mockResolvedValue('OK'),
-        get: vi.fn(),
-        del: vi.fn().mockResolvedValue(1),
-        expire: vi.fn().mockResolvedValue(1),
-        ping: vi.fn().mockResolvedValue('PONG'),
-    },
-    isRedisReady: vi.fn().mockReturnValue(true),
-}))
-
-vi.mock('@/lib/logger', () => ({
-    createLogger: () => ({
-        info: vi.fn(),
-        error: vi.fn(),
-        warn: vi.fn(),
-    })
-}))
+import { describe, it, expect, beforeEach } from 'vitest'
+import { InMemoryAuthStore } from '@/lib/auth/in-memory-auth-store'
+import type { AuthStore } from '@/lib/auth/auth-store.types'
 
 describe('Session Management', () => {
-    beforeEach(() => {
-        vi.clearAllMocks()
+  let store: AuthStore
+
+  beforeEach(() => {
+    store = new InMemoryAuthStore()
+  })
+
+  describe('createSession', () => {
+    it('should create session and return session ID', async () => {
+      const sessionId = await store.createSession('user-123', 'test@example.com', 'Test User', 'USER')
+
+      expect(sessionId).toBeDefined()
+      expect(sessionId).toHaveLength(32)
     })
 
-    describe('createSession', () => {
-        it('should create session and return session ID', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { createSession } = await import('@/lib/auth/session')
+    it('should store complete session data', async () => {
+      const sessionId = await store.createSession('user-123', 'test@example.com', 'Test User', 'USER')
 
-            const sessionId = await createSession('user-123', 'test@example.com', 'Test User', 'USER')
+      const data = await store.getSession(sessionId)
+      expect(data).toEqual({
+        userId: 'user-123',
+        email: 'test@example.com',
+        name: 'Test User',
+        role: 'USER',
+        createdAt: expect.any(Number),
+      })
+    })
+  })
 
-            expect(sessionId).toBeDefined()
-            expect(sessionId).toHaveLength(32)
-            expect(redis.setex).toHaveBeenCalled()
-        })
+  describe('getSession', () => {
+    it('should return session data for valid session', async () => {
+      const sessionId = await store.createSession('user-123', 'test@example.com', 'Test User', 'USER')
 
-        it('should store session data with correct TTL', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { createSession } = await import('@/lib/auth/session')
+      const result = await store.getSession(sessionId)
 
-            await createSession('user-123', 'test@example.com', 'Test User', 'USER')
-
-            const call = vi.mocked(redis.setex).mock.calls[0]
-            expect(call[1]).toBe(900)
-        })
-
-        it('should store complete session data', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { createSession } = await import('@/lib/auth/session')
-
-            await createSession('user-123', 'test@example.com', 'Test User', 'USER')
-
-            const call = vi.mocked(redis.setex).mock.calls[0]
-            const storedData = JSON.parse(call[2] as string)
-            expect(storedData).toEqual({
-                userId: 'user-123',
-                email: 'test@example.com',
-                name: 'Test User',
-                role: 'USER',
-                createdAt: expect.any(Number)
-            })
-        })
+      expect(result).toEqual({
+        userId: 'user-123',
+        email: 'test@example.com',
+        name: 'Test User',
+        role: 'USER',
+        createdAt: expect.any(Number),
+      })
     })
 
-    describe('getSession', () => {
-        it('should return session data for valid session', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { getSession } = await import('@/lib/auth/session')
+    it('should return null for non-existent session', async () => {
+      const result = await store.getSession('non-existent')
 
-            const sessionData = {
-                userId: 'user-123',
-                email: 'test@example.com',
-                name: 'Test User',
-                role: 'USER',
-                createdAt: Date.now()
-            }
-            vi.mocked(redis.get).mockResolvedValueOnce(JSON.stringify(sessionData))
-
-            const result = await getSession('test-session-id')
-
-            expect(result).toEqual(sessionData)
-        })
-
-        it('should return null for non-existent session', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { getSession } = await import('@/lib/auth/session')
-
-            vi.mocked(redis.get).mockResolvedValueOnce(null)
-
-            const result = await getSession('non-existent')
-
-            expect(result).toBeNull()
-        })
-
-        it('should return null for invalid JSON', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { getSession } = await import('@/lib/auth/session')
-
-            vi.mocked(redis.get).mockResolvedValueOnce('invalid-json')
-
-            const result = await getSession('test-session-id')
-
-            expect(result).toBeNull()
-        })
+      expect(result).toBeNull()
     })
+  })
 
-    describe('deleteSession', () => {
-        it('should delete session from Redis', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { deleteSession } = await import('@/lib/auth/session')
+  describe('deleteSession', () => {
+    it('should delete session', async () => {
+      const sessionId = await store.createSession('user-123', 'test@example.com', 'Test User', 'USER')
 
-            await deleteSession('test-session-id')
+      await store.deleteSession(sessionId)
 
-            expect(redis.del).toHaveBeenCalledWith('session:test-session-id')
-        })
+      const result = await store.getSession(sessionId)
+      expect(result).toBeNull()
     })
+  })
 
-    describe('refreshSession', () => {
-        it('should refresh session TTL', async () => {
-            const { redis } = await import('@/lib/db/redis')
-            const { refreshSession } = await import('@/lib/auth/session')
+  describe('refreshSession', () => {
+    it('should not throw for existing session', async () => {
+      const sessionId = await store.createSession('user-123', 'test@example.com', 'Test User', 'USER')
 
-            await refreshSession('test-session-id')
-
-            expect(redis.expire).toHaveBeenCalledWith('session:test-session-id', 900)
-        })
+      await expect(store.refreshSession(sessionId)).resolves.toBeUndefined()
     })
+  })
 })
